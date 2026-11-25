@@ -32,7 +32,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_REPOS = ["Marvisak/VIctory", "fxceless/victory-fork"]
 RUNS_REPO = os.environ.get("VICTORY_DOCTOR_RUNS_REPO", "shawshanker18/victory-runs")
 HOME = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "victory-doctor"
@@ -271,16 +271,32 @@ def find_crash_files(log_path):
     return out
 
 
-def tail_since(path, since):
-    """The entries of crashes.log written after `since` (unix seconds)."""
+def tail_since(path, since, until=None):
+    """The entries of crashes.log written from `since` to `until` (unix seconds)."""
     text = path.read_text(errors="replace")
     blocks = re.split(r"\n(?=unix time )", text)
     keep = []
     for b in blocks:
         m = re.match(r"unix time (\d+)", b)
-        if m and int(m.group(1)) >= since:
+        if m and int(m.group(1)) >= since and (until is None or int(m.group(1)) <= until):
             keep.append(b)
     return "\n".join(keep).splitlines()
+
+
+def log_end(log):
+    """The last timestamp in a log (unix seconds), plus five minutes for the crash report."""
+    stamp = None
+    with open(log, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 65536))
+        for line in f.read().decode(errors="replace").splitlines():
+            m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", clean(line))
+            if m:
+                stamp = m.group(1)
+    if not stamp:
+        return None
+    t = datetime.datetime.fromisoformat(stamp).replace(tzinfo=datetime.timezone.utc)
+    return int(t.timestamp()) + 300
 
 
 def scan(log, crashes=None, title_crashes=(), since=None):
@@ -288,7 +304,8 @@ def scan(log, crashes=None, title_crashes=(), since=None):
     if log:
         scan_lines(Path(log).read_text(errors="replace").splitlines(), found, str(log))
     if crashes:
-        lines = tail_since(Path(crashes), since) if since else Path(crashes).read_text(errors="replace").splitlines()
+        until = log_end(log) if (log and since) else None
+        lines = tail_since(Path(crashes), since, until) if since else Path(crashes).read_text(errors="replace").splitlines()
         scan_lines(lines, found, str(crashes))
     for t in title_crashes:
         scan_title_crash(Path(t).read_text(errors="replace").splitlines(), found, str(t))
@@ -734,6 +751,10 @@ def cmd_scan(a):
     check(sigs, a.repos, a.offline, a.most)
     meta = {"log": str(a.log), "settings": settings_from_env(), "machine": machine() if not a.offline else {}}
     save_last(sigs, meta)
+    if a.json == "-":
+        print(json.dumps({"tool": f"victory-doctor {VERSION}", "log": str(a.log),
+                          "signatures": [dict(s.to_json(), number=n) for n, s in enumerate(sigs, 1)]}, indent=1))
+        return
     if a.json:
         Path(a.json).write_text(json.dumps([s.to_json() for s in sigs], indent=1))
     show(sigs)
@@ -794,42 +815,60 @@ def cmd_comment(a):
         webbrowser.open(url)
 
 
-def cmd_compare(a):
-    def load(ref):
-        rec = load_record(ref)
-        if rec is not None:
-            return rec, {f["key"]: f["count"] for f in rec["failures"]}
-        sigs = scan(ref)
-        return make_record(ref, sigs, mach={}), {s.key: s.count for s in sigs}
+def load_run(ref):
+    """A run record by id or file, or one made from a log."""
+    rec = load_record(ref)
+    if rec is not None:
+        return rec
+    return make_record(ref, scan(ref), mach={})
 
-    (ra, fa), (rb, fb) = load(a.a), load(a.b)
-    print(f"A: {a.a}\nB: {a.b}\n")
+
+def compare_data(ra, rb):
     pa, pb = ra["performance"], rb["performance"]
-    for k in ("reached", "fps_median", "ms_median", "gpu_ms_median", "draws_median"):
+    perf = []
+    for k in ("reached", "fps_median", "fps_p10", "ms_median", "gpu_ms_median", "draws_median"):
         va, vb = pa.get(k), pb.get(k)
         if va is None and vb is None:
             continue
-        diff = ""
+        pct = None
         if isinstance(va, (int, float)) and isinstance(vb, (int, float)) and va:
-            diff = f"  ({(vb - va) / va * 100:+.0f}%)"
-        print(f"  {k:14} {va!s:>10} -> {vb!s:<10}{diff}")
-    sa, sb = set(fa), set(fb)
+            pct = round((vb - va) / va * 100, 1)
+        perf.append({"metric": k, "a": va, "b": vb, "change_pct": pct})
+    fa = {f["key"]: f["count"] for f in ra.get("failures", [])}
+    fb = {f["key"]: f["count"] for f in rb.get("failures", [])}
+    sa_, sb_ = ra.get("settings", {}), rb.get("settings", {})
+    return {
+        "a": ra.get("id"), "b": rb.get("id"),
+        "performance": perf,
+        "new_in_b": [{"key": k, "count": fb[k]} for k in sorted(set(fb) - set(fa))],
+        "gone_in_b": [{"key": k, "count": fa[k]} for k in sorted(set(fa) - set(fb))],
+        "in_both": sorted(set(fa) & set(fb)),
+        "settings_changed": [{"key": k, "a": sa_.get(k), "b": sb_.get(k)}
+                             for k in sorted(set(sa_) | set(sb_)) if sa_.get(k) != sb_.get(k)],
+    }
+
+
+def cmd_compare(a):
+    d = compare_data(load_run(a.a), load_run(a.b))
+    if a.json:
+        print(json.dumps(d, indent=1))
+        return
+    print(f"A: {a.a}\nB: {a.b}\n")
+    for p in d["performance"]:
+        diff = f"  ({p['change_pct']:+.0f}%)" if p["change_pct"] is not None else ""
+        print(f"  {p['metric']:14} {p['a']!s:>10} -> {p['b']!s:<10}{diff}")
     print("\nOnly in B (new):")
-    for k in sorted(sb - sa):
-        print(f"  + {k}  x{fb[k]}")
+    for f in d["new_in_b"]:
+        print(f"  + {f['key']}  x{f['count']}")
     print("Only in A (gone in B):")
-    for k in sorted(sa - sb):
-        print(f"  - {k}  x{fa[k]}")
-    both = sorted(sa & sb)
-    if both:
-        print(f"In both: {len(both)}")
-    sets = {**ra.get("settings", {}), **rb.get("settings", {})}
-    changed = {k: (ra.get("settings", {}).get(k), rb.get("settings", {}).get(k)) for k in sets
-               if ra.get("settings", {}).get(k) != rb.get("settings", {}).get(k)}
-    if changed:
+    for f in d["gone_in_b"]:
+        print(f"  - {f['key']}  x{f['count']}")
+    if d["in_both"]:
+        print(f"In both: {len(d['in_both'])}")
+    if d["settings_changed"]:
         print("\nSettings that differ:")
-        for k, (x, y) in sorted(changed.items()):
-            print(f"  {k}: {x} -> {y}")
+        for s in d["settings_changed"]:
+            print(f"  {s['key']}: {s['a']} -> {s['b']}")
 
 
 def cmd_record(a):
@@ -861,40 +900,61 @@ def cmd_submit(a):
                         urllib.parse.urlencode({"title": title, "body": body[:7000]}))
 
 
-def cmd_stats(a):
+VIRTUAL = ("virtual", "basic display", "basic render", "mobile monitor", "remote display")
+
+
+def stats_data(gpu=None, setting=None, mine=False):
     url = f"https://raw.githubusercontent.com/{RUNS_REPO}/main/data/runs.jsonl"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "victory-doctor"}), timeout=30) as r:
-            rows = [json.loads(l) for l in r.read().decode().splitlines() if l.strip()]
-    except (urllib.error.URLError, ValueError) as e:
-        sys.exit(f"Could not read the shared runs ({e}).")
-    rows += [json.loads(p.read_text()) for p in runs_dir().glob("*.json")] if a.mine else []
-    if a.gpu:
-        rows = [r for r in rows if any(a.gpu.lower() in g.lower() for g in r["machine"].get("gpus", []))]
-    if a.setting:
-        rows = [r for r in rows if a.setting in r.get("settings", {})]
-    print(f"{len(rows)} run(s)\n")
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "victory-doctor"}), timeout=30) as r:
+        rows = [json.loads(l) for l in r.read().decode().splitlines() if l.strip()]
+    if mine:
+        rows += [json.loads(p.read_text()) for p in runs_dir().glob("*.json")]
+    if gpu:
+        rows = [r for r in rows if any(gpu.lower() in g.lower() for g in r["machine"].get("gpus", []))]
+    if setting:
+        rows = [r for r in rows if setting in r.get("settings", {})]
     groups = {}
     for r in rows:
-        gpu = next((g for g in r["machine"].get("gpus", []) if "Radeon(TM) Graphics" not in g), "?")
-        key = (gpu.split(" (driver")[0], r["emulator"].get("console", "?"))
-        groups.setdefault(key, []).append(r)
-    for (gpu, console), rs in sorted(groups.items()):
+        gpus = [g for g in r["machine"].get("gpus", []) if not any(v in g.lower() for v in VIRTUAL)]
+        main = next((g for g in gpus if "Radeon(TM) Graphics" not in g and "UHD" not in g), gpus[0] if gpus else "?")
+        groups.setdefault((main.split(" (driver")[0], r.get("emulator", {}).get("console", "?")), []).append(r)
+    out = []
+    for (g, console), rs in sorted(groups.items()):
         fps = [r["performance"]["fps_median"] for r in rs if r["performance"].get("fps_median")]
-        world = sum(1 for r in rs if r["performance"].get("reached") == "world")
         best = max(rs, key=lambda r: r["performance"].get("fps_median") or 0)
-        print(f"{gpu} [{console}]: {len(rs)} run(s), {world} reached the world"
-              + (f", median {statistics.median(fps):.1f} fps, best {max(fps):.1f}" if fps else ""))
-        if best["performance"].get("fps_median"):
-            print("   best settings: " + (", ".join(f"{k}={v}" for k, v in best.get("settings", {}).items()) or "defaults"))
+        out.append({
+            "gpu": g, "console": console, "runs": len(rs),
+            "reached_world": sum(1 for r in rs if r["performance"].get("reached") == "world"),
+            "fps_median": statistics.median(fps) if fps else None,
+            "fps_best": max(fps) if fps else None,
+            "best_settings": best.get("settings", {}) if fps else {},
+        })
     common = {}
     for r in rows:
         for f in r.get("failures", [])[:5]:
             common[f["key"]] = common.get(f["key"], 0) + 1
-    if common:
+    return {"runs": len(rows), "groups": out,
+            "common_failures": [{"key": k, "runs": n} for k, n in sorted(common.items(), key=lambda x: -x[1])[:10]]}
+
+
+def cmd_stats(a):
+    try:
+        d = stats_data(a.gpu, a.setting, a.mine)
+    except (urllib.error.URLError, ValueError) as e:
+        sys.exit(f"Could not read the shared runs ({e}).")
+    if a.json:
+        print(json.dumps(d, indent=1))
+        return
+    print(f"{d['runs']} run(s)\n")
+    for g in d["groups"]:
+        print(f"{g['gpu']} [{g['console']}]: {g['runs']} run(s), {g['reached_world']} reached the world"
+              + (f", median {g['fps_median']:.1f} fps, best {g['fps_best']:.1f}" if g["fps_median"] else ""))
+        if g["fps_median"]:
+            print("   best settings: " + (", ".join(f"{k}={v}" for k, v in g["best_settings"].items()) or "defaults"))
+    if d["common_failures"]:
         print("\nMost common failures:")
-        for k, n in sorted(common.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {n:3} run(s): {k}")
+        for f in d["common_failures"]:
+            print(f"  {f['runs']:3} run(s): {f['key']}")
 
 
 def cmd_run(a):
@@ -944,6 +1004,209 @@ def cmd_run(a):
     ns = argparse.Namespace(log=str(log), crashes=None, no_auto=False, all_crashes=False, hours=0,
                             offline=a.offline, repos=a.repos, most=a.most, json=None)
     cmd_scan(ns)
+
+
+UI_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>victory-doctor</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#16181d;--muted:#5b6270;--line:#e3e6eb;--acc:#2f6fed;
+--new:#c0392b;--known:#b7791f;--pr:#2f6fed;--merged:#2e8b57;--closed:#6b7280}
+@media (prefers-color-scheme:dark){:root{--bg:#111318;--card:#1a1d24;--fg:#e8eaee;--muted:#9aa1ad;--line:#2a2f39;--acc:#6c9bff}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+h1{font-size:18px;margin:0}nav button{background:none;border:0;color:var(--muted);font:inherit;padding:6px 10px;cursor:pointer;border-radius:6px}
+nav button.on{color:var(--fg);background:var(--card)}main{max-width:1000px;margin:0 auto;padding:20px 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+button.b{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 12px;font:inherit;cursor:pointer}
+button.g{background:none;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
+.badge{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;color:#fff;white-space:nowrap}
+.NEW{background:var(--new)}.KNOWN{background:var(--known)}.PR{background:var(--pr)}.MERGED{background:var(--merged)}.CLOSED,.--{background:var(--closed)}
+.t{font-weight:600}.muted{color:var(--muted)}a{color:var(--acc)}ul{margin:6px 0 0;padding-left:18px}
+pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;font-size:12px;max-height:340px;overflow:auto}
+table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+input,select{font:inherit;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+.hide{display:none}
+</style></head><body>
+<header><h1>victory-doctor</h1><nav>
+<button data-tab="scan" class="on">Diagnose a run</button><button data-tab="runs">My runs</button><button data-tab="shared">Shared runs</button>
+</nav></header>
+<main>
+<section id="scan">
+ <div class="card"><div class="row"><input type="file" id="file" accept=".log,.txt,.out">
+ <label><input type="checkbox" id="offline"> offline</label><button class="b" id="go">Diagnose</button>
+ <span id="busy" class="muted"></span></div>
+ <p class="muted">Pick a VIctory log (the output of <code>victory run ... --execute</code>). crashes.log and the title's crash reports on this PC are read too. Only search terms (offsets, error codes, message words) go to GitHub.</p></div>
+ <div id="results"></div>
+</section>
+<section id="runs" class="hide"><div class="card"><div class="row">
+ <select id="ra"></select><span>vs</span><select id="rb"></select><button class="b" id="cmp">Compare</button></div></div>
+ <div id="cmpout"></div><div id="runlist"></div></section>
+<section id="shared" class="hide"><div class="card"><div class="row"><input id="sgpu" placeholder="GPU filter, e.g. 4060">
+ <button class="b" id="sgo">Load shared runs</button></div><p class="muted">From the public dataset; submit your own runs with <code>submit &lt;run id&gt;</code>.</p></div>
+ <div id="sout"></div></section>
+</main>
+<script>
+const $=s=>document.querySelector(s), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const MARK={"fix merged":"MERGED","fix proposed":"PR","known, open":"KNOWN","known, closed":"CLOSED","new":"NEW","not checked":"--"};
+async function call(path,body){const r=await fetch(path,{method:body?"POST":"GET",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
+ const j=await r.json(); if(!r.ok) throw new Error(j.error||r.status); return j}
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("on",x===b));
+ document.querySelectorAll("main section").forEach(s=>s.classList.toggle("hide",s.id!==b.dataset.tab)); if(b.dataset.tab==="runs") runs()});
+$("#go").onclick=async()=>{const f=$("#file").files[0]; if(!f) return alert("Pick a log file first.");
+ $("#busy").textContent="Diagnosing and searching GitHub..."; $("#results").innerHTML="";
+ try{const d=await call("/api/scan",{name:f.name,log:await f.text(),offline:$("#offline").checked}); render(d)}catch(e){$("#results").innerHTML=`<div class=card>${esc(e.message)}</div>`}
+ $("#busy").textContent=""};
+function render(d){const sigs=d.signatures; if(!sigs.length){$("#results").innerHTML="<div class=card>No failures found.</div>";return}
+ $("#results").innerHTML=`<p class=muted>${sigs.length} failure signature(s). Run record ${esc(d.record)} saved.</p>`+sigs.map((s,i)=>{
+  const m=MARK[s.status]||"--", others=s.matches.filter(x=>!x.pr).length;
+  return `<div class=card><div class=row><span class="badge ${m}">${m}</span><span class=t>${esc(s.title)}</span><span class=muted>x${s.count}</span></div>
+  ${s.advice?`<p>${esc(s.advice)}</p>`:""}${s.details.hashes?`<p class=muted>shaders: ${s.details.hashes.slice(0,6).map(esc).join(", ")}</p>`:""}
+  <p class=muted>${m==="NEW"?"Nobody has reported this yet.":others+" report(s) by others."}</p>
+  <ul>${s.matches.slice(0,8).map(x=>`<li><a href="${esc(x.url)}" target=_blank>${esc(x.repo)}#${x.number}</a> ${x.pr?"PR":"issue"} ${x.merged?"merged":esc(x.state)}, ${x.comments} comments: ${esc(x.title)}</li>`).join("")}</ul>
+  <div class=row style="margin-top:8px"><button class=g onclick="draft(${i+1})">${m==="NEW"?"Draft a new issue":"Draft an issue anyway"}</button>
+  ${s.matches.filter(x=>!x.pr).slice(0,3).map(x=>`<button class=g onclick="metoo(${i+1},'${esc(x.repo)}',${x.number})">Add my details to #${x.number}</button>`).join("")}</div>
+  <div id="d${i+1}"></div></div>`}).join("")}
+async function draft(n){const d=await call("/api/draft",{n}); $("#d"+n).innerHTML=`<pre>${esc(d.title+"\n\n"+d.body)}</pre>
+ <div class=row><a class=b href="${esc(d.url)}" target=_blank style="text-decoration:none;padding:7px 12px;border-radius:6px;background:var(--acc);color:#fff">Open the filled-in form on GitHub</a><span class=muted>You check it and submit it there.</span></div>`}
+async function metoo(n,repo,issue){const d=await call("/api/comment",{n,repo,issue}); $("#d"+n).innerHTML=`<pre>${esc(d.body)}</pre>
+ <div class=row><button class=g onclick="navigator.clipboard.writeText(${esc(JSON.stringify(d.body))})">Copy</button><a href="${esc(d.url)}" target=_blank>Open ${esc(repo)}#${issue} to paste it</a></div>`}
+async function runs(){const d=await call("/api/runs"); const opt=d.map(r=>`<option value="${esc(r.id)}">${esc(r.date)} ${esc(r.reached)} ${r.fps??""}</option>`).join("");
+ $("#ra").innerHTML=opt; $("#rb").innerHTML=opt; if(d.length>1) $("#rb").selectedIndex=0,$("#ra").selectedIndex=1;
+ $("#runlist").innerHTML=`<div class=card><table><tr><th>Run</th><th>Date</th><th>Reached</th><th>fps</th><th>ms/frame</th><th>Failures</th></tr>${d.map(r=>`<tr><td>${esc(r.id)}</td><td>${esc(r.date)}</td><td>${esc(r.reached)}</td><td>${r.fps??""}</td><td>${r.ms??""}</td><td>${r.failures}</td></tr>`).join("")}</table></div>`}
+$("#cmp").onclick=async()=>{const d=await call("/api/compare",{a:$("#ra").value,b:$("#rb").value});
+ $("#cmpout").innerHTML=`<div class=card><table><tr><th>Metric</th><th>A</th><th>B</th><th>Change</th></tr>${d.performance.map(p=>`<tr><td>${esc(p.metric)}</td><td>${esc(p.a)}</td><td>${esc(p.b)}</td><td>${p.change_pct==null?"":(p.change_pct>0?"+":"")+p.change_pct+"%"}</td></tr>`).join("")}</table>
+ <p class=t>New in B</p><ul>${d.new_in_b.map(f=>`<li>${esc(f.key)} x${f.count}</li>`).join("")||"<li class=muted>none</li>"}</ul>
+ <p class=t>Gone in B</p><ul>${d.gone_in_b.map(f=>`<li>${esc(f.key)} x${f.count}</li>`).join("")||"<li class=muted>none</li>"}</ul>
+ <p class=t>Settings changed</p><ul>${d.settings_changed.map(s=>`<li>${esc(s.key)}: ${esc(s.a)} &rarr; ${esc(s.b)}</li>`).join("")||"<li class=muted>none</li>"}</ul></div>`};
+$("#sgo").onclick=async()=>{try{const d=await call("/api/stats?gpu="+encodeURIComponent($("#sgpu").value));
+ $("#sout").innerHTML=`<div class=card><p class=muted>${d.runs} shared run(s)</p><table><tr><th>GPU</th><th>Mode</th><th>Runs</th><th>Reached world</th><th>Median fps</th><th>Best</th><th>Best settings</th></tr>
+ ${d.groups.map(g=>`<tr><td>${esc(g.gpu)}</td><td>${esc(g.console)}</td><td>${g.runs}</td><td>${g.reached_world}</td><td>${g.fps_median??""}</td><td>${g.fps_best??""}</td><td class=muted>${esc(Object.entries(g.best_settings).map(([k,v])=>k+"="+v).join(", ")||"defaults")}</td></tr>`).join("")}</table>
+ <p class=t>Most common failures</p><ul>${d.common_failures.map(f=>`<li>${f.runs} run(s): ${esc(f.key)}</li>`).join("")}</ul></div>`}catch(e){$("#sout").innerHTML=`<div class=card>${esc(e.message)}</div>`}};
+</script></body></html>"""
+
+
+def cmd_ui(a):
+    """A local page (127.0.0.1 only) over the same functions as the commands."""
+    import http.server
+    import socketserver
+    import tempfile
+
+    host_ok = {f"127.0.0.1:{a.port}", f"localhost:{a.port}"}
+
+    def advice_for(s):
+        return next((v for k, v in ADVICE.items() if k in s.key), None)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, code, obj, html=False):
+            data = obj.encode() if html else json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8" if html else "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def guard(self):
+            # Pages from other sites must not drive this server.
+            if self.headers.get("Host") not in host_ok:
+                self.reply(403, {"error": "forbidden"})
+                return False
+            return True
+
+        def do_GET(self):
+            if not self.guard():
+                return
+            path, _, query = self.path.partition("?")
+            q = urllib.parse.parse_qs(query)
+            try:
+                if path == "/":
+                    return self.reply(200, UI_PAGE, html=True)
+                if path == "/api/runs":
+                    rows = []
+                    for p in sorted(runs_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                        r = json.loads(p.read_text())
+                        rows.append({"id": r["id"], "date": r["date"], "reached": r["performance"].get("reached"),
+                                     "fps": r["performance"].get("fps_median"), "ms": r["performance"].get("ms_median"),
+                                     "failures": len(r.get("failures", []))})
+                    return self.reply(200, rows)
+                if path == "/api/stats":
+                    return self.reply(200, stats_data(q.get("gpu", [""])[0] or None))
+                self.reply(404, {"error": "not found"})
+            except Exception as e:  # shown on the page
+                self.reply(500, {"error": str(e)})
+
+        def do_POST(self):
+            if not self.guard():
+                return
+            n = int(self.headers.get("Content-Length", "0"))
+            if n > 200 * 1024 * 1024:
+                return self.reply(413, {"error": "too large"})
+            body = json.loads(self.rfile.read(n) or b"{}")
+            try:
+                if self.path == "/api/scan":
+                    d = Path(tempfile.mkdtemp(prefix="victory-doctor-"))
+                    log = d / Path(body.get("name") or "run.log").name
+                    log.write_text(body.get("log", ""), encoding="utf-8")
+                    since = log_start(log) if log.stat().st_size else None
+                    files = find_crash_files(log)
+                    crashes = next((p for k, p in files if k == "crashes"), None)
+                    titles = [p for k, p in files if k == "title-crash" and since and p.stat().st_mtime >= since]
+                    sigs = scan(log, crashes, titles, since)
+                    check(sigs, DEFAULT_REPOS, bool(body.get("offline")))
+                    meta = {"log": log.name, "settings": settings_from_env(), "machine": machine()}
+                    save_last(sigs, meta)
+                    rec = make_record(log, sigs, meta["settings"], mach=meta["machine"])
+                    save_record(rec)
+                    out = [dict(s.to_json(), advice=advice_for(s)) for s in sigs]
+                    return self.reply(200, {"signatures": out, "record": rec["id"]})
+                if self.path == "/api/draft":
+                    meta, s = pick(int(body["n"]))
+                    title, text = issue_draft(meta, s)
+                    url = f"https://github.com/{DEFAULT_REPOS[0]}/issues/new?" + urllib.parse.urlencode(
+                        {"title": title, "body": text[:6000]})
+                    return self.reply(200, {"title": title, "body": text, "url": url})
+                if self.path == "/api/comment":
+                    meta, s = pick(int(body["n"]))
+                    repo = body.get("repo") or DEFAULT_REPOS[0]
+                    return self.reply(200, {"body": comment_draft(meta, s, body["issue"]),
+                                            "url": f"https://github.com/{repo}/issues/{int(body['issue'])}"})
+                if self.path == "/api/compare":
+                    return self.reply(200, compare_data(load_run(body["a"]), load_run(body["b"])))
+                self.reply(404, {"error": "not found"})
+            except SystemExit as e:
+                self.reply(400, {"error": str(e)})
+            except Exception as e:  # shown on the page
+                self.reply(500, {"error": str(e)})
+
+    class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        # On Windows reuse lets two servers share a port silently.
+        allow_reuse_address = False
+
+    srv = None
+    for port in range(a.port, a.port + 20):
+        try:
+            srv = Server(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            continue
+    if srv is None:
+        sys.exit(f"No free port from {a.port} to {a.port + 19}.")
+    a.port = port
+    host_ok.clear()
+    host_ok.update({f"127.0.0.1:{port}", f"localhost:{port}"})
+    url = f"http://127.0.0.1:{port}/"
+    print(f"victory-doctor UI at {url} (Ctrl+C stops it)", flush=True)
+    if not a.no_browser:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_selftest(_):
@@ -1003,7 +1266,7 @@ def main():
     p.add_argument("--no-auto", action="store_true", help="do not look for crash files")
     p.add_argument("--all-crashes", action="store_true", help="every crashes.log entry, not only this run's")
     p.add_argument("--hours", type=int, default=0, help="also take crash entries from this many hours before the log")
-    p.add_argument("--json", help="write the signatures here")
+    p.add_argument("--json", help="write the signatures to this file, or `-` for JSON on stdout (for scripts and agents)")
     repos(p)
     p.set_defaults(fn=cmd_scan)
 
@@ -1038,7 +1301,13 @@ def main():
     p = sub.add_parser("compare", help="compare two logs or run records")
     p.add_argument("a")
     p.add_argument("b")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(fn=cmd_compare)
+
+    p = sub.add_parser("ui", help="open the local web UI (127.0.0.1 only)")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-browser", action="store_true")
+    p.set_defaults(fn=cmd_ui)
 
     p = sub.add_parser("record", help="make a run record from a log")
     p.add_argument("log")
@@ -1056,6 +1325,7 @@ def main():
     p.add_argument("--gpu")
     p.add_argument("--setting")
     p.add_argument("--mine", action="store_true", help="include your own unsubmitted runs")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(fn=cmd_stats)
 
     p = sub.add_parser("selftest", help="check the parsers")

@@ -14,7 +14,19 @@ It also keeps a record of every run (hardware, build, settings, frame rates, fai
 
 Python 3.9 or newer, nothing else. Download `victory_doctor.py`.
 
-## Use
+## The UI
+
+```
+python victory_doctor.py ui
+```
+
+It opens a page on your own PC (127.0.0.1 only):
+
+- **Diagnose a run:** pick a log. Each failure shows a NEW / KNOWN / PR / MERGED badge, the matching reports, and buttons to draft an issue or add your details to an existing one.
+- **My runs:** every run you diagnosed, and any two compared side by side.
+- **Shared runs:** frame rates by GPU, the best settings seen, and the most common failures, from everyone's submitted runs.
+
+## Use from the command line
 
 Run the game through it. Failures are listed as they happen, and the full diagnosis comes when the game exits:
 
@@ -50,7 +62,10 @@ Then:
 | `record LOG` | makes a run record from a log (`--setting KEY=VALUE` for what you changed) |
 | `submit RUN` | shares a run record in the public runs dataset |
 | `stats` | what the shared runs say: frame rates by GPU, the best settings seen, the most common failures |
+| `ui` | the same in a local web page |
 | `selftest` | checks the parsers |
+
+`scan --json -`, `compare --json` and `stats --json` print JSON for scripts and agents: see [AGENTS.md](AGENTS.md).
 
 GitHub lookups work without an account (10 searches a minute). With `GITHUB_TOKEN` set, or the GitHub CLI signed in, they are faster. Results are cached for 12 hours. `--offline` skips them; `--repos` chooses where to search (default: Marvisak/VIctory and fxceless/victory-fork).
 
@@ -68,6 +83,10 @@ Every shared run is one JSON record: machine (CPU, GPUs and drivers, RAM, OS), e
 ```
 https://raw.githubusercontent.com/shawshanker18/victory-runs/main/data/runs.jsonl
 ```
+
+## Help it grow
+
+The more runs are diagnosed and shared, the faster duplicates disappear and real fixes surface. If victory-doctor saved you time, a ⭐ helps other testers find it, and `submit` adds your runs to the dataset.
 
 ## Licence
 
