@@ -17,7 +17,7 @@ Progress messages go to stderr; stdout is only the JSON.
 
 ```json
 {
-  "tool": "victory-doctor 0.2.0",
+  "tool": "victory-doctor 0.3.0",
   "log": "run.log",
   "signatures": [
     {

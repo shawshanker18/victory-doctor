@@ -32,7 +32,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_REPOS = ["Marvisak/VIctory", "fxceless/victory-fork"]
 RUNS_REPO = os.environ.get("VICTORY_DOCTOR_RUNS_REPO", "shawshanker18/victory-runs")
 HOME = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "victory-doctor"
@@ -86,11 +86,26 @@ QUIET = [
 # Advice for failures whose cause is well known, keyed by a substring of the
 # signature key.
 ADVICE = {
-    "os error 1455": "Windows ran out of commit: close other programs or raise the paging file size (Task Manager > Performance > Memory > Committed).",
-    "0xc000001d": "Your CPU lacks an instruction the title uses (CLWB/CLZERO/MONITORX): look for the CPU-emulation patches in the matches.",
-    "view heap capped": "NVIDIA drivers cap shader-visible heaps at 1,000,000 descriptors; the title asks for 1,245,184 (see the matches).",
-    "title slot past the host heap": "NVIDIA drivers cap shader-visible heaps at 1,000,000 descriptors; the title asks for 1,245,184 (see the matches).",
-    "pool INSTANCE_LIST full": "The title's instance pool filled up; this follows very low frame rates in the world.",
+    "os error 1455": "Windows ran out of commit: close other programs or raise the paging file size "
+                     "(Task Manager > Performance > Memory > Committed). Marvisak/VIctory#23.",
+    "0xc000001d": "Your CPU lacks an instruction the title uses (CLWB/CLZERO/MONITORX), common on Intel and older CPUs. "
+                  "CPU-emulation patches: Marvisak/VIctory#85.",
+    "view heap capped": "NVIDIA drivers cap shader-visible heaps at 1,000,000 descriptors; the title asks for 1,245,184. "
+                        "Measurements and fixes: Marvisak/VIctory#1760, #902.",
+    "title slot past the host heap": "NVIDIA drivers cap shader-visible heaps at 1,000,000 descriptors; the title asks for 1,245,184. "
+                                     "Measurements and fixes: Marvisak/VIctory#1760, #902.",
+    "pool INSTANCE_LIST full": "The title's instance pool filled up; this follows very low frame rates in the world "
+                               "(Marvisak/VIctory#698).",
+    "image+0x23cf683": "A stop in the title's own code about a minute into the world, reported by many "
+                       "(Marvisak/VIctory#1118); it follows long stalls, so anything that raises the frame rate delays it.",
+    "image+0xb5a5f8": "Early crash right after sign-in (XUserAddAsync), mostly on Windows 10 and NVIDIA: Marvisak/VIctory#2521, #789.",
+    "0x887a0006": "GPU hang (TDR). Common in the world on NVIDIA; raising TdrDelay only delays it (Marvisak/VIctory#1117).",
+    "a pipeline creation method that is not implemented": "Expected for now: VIctory does not implement this "
+                                                          "pipeline-creation slot yet, and the title goes on without it.",
+    "a black frame after a frame that was not": "Mostly harmless flicker while loading or in cutscenes; many reports.",
+    "wave size": "NVIDIA GPUs run 32-lane waves only, so compute programs that need 64 are refused "
+                 "(Marvisak/VIctory#2220); the wave64 split work (#189, #2214) addresses it.",
+    "root signature": "On Windows 10 the D3D12 Agility SDK is needed (Marvisak/VIctory#753, #84).",
 }
 
 
@@ -552,12 +567,27 @@ def machine():
     return m
 
 
+# Settings whose values name title memory: kept as "set", not their value.
+TITLE_VALUED = ("VICTORY_PEEK", "VICTORY_WATCH", "VICTORY_CRASH_SAVE", "VICTORY_PATCH", "VICTORY_DUMP_MATCH")
+
+
+def public_setting(k, v):
+    """A setting's value as records and posts may carry it."""
+    if k in TITLE_VALUED:
+        return "<set>"
+    hashes = HASH16.findall(v)
+    if hashes:
+        # A list of title shader hashes (VICTORY_SKIP_PIPELINES and the like).
+        return f"<{len(hashes)} shader hashes>"
+    return redact(v) if ("\\" in v or "/" in v) else v
+
+
 def settings_from_env(env=None):
     env = env or os.environ
     out = {}
     for k, v in sorted(env.items()):
         if k.startswith("VICTORY_") and "TOKEN" not in k and "KEY" not in k:
-            out[k] = redact(v) if ("\\" in v or "/" in v) else v
+            out[k] = public_setting(k, v)
     return out
 
 
@@ -666,23 +696,40 @@ def environment_block(meta):
     if m.get("ram_gb"):
         lines.append(f"- RAM: {m['ram_gb']} GB")
     if meta.get("settings"):
-        lines.append("- Settings: " + ", ".join(f"`{k}={v}`" for k, v in meta["settings"].items()))
+        lines.append("- Settings: " + ", ".join(f"`{k}={public_setting(k, v)}`" for k, v in meta["settings"].items()))
     if meta.get("emulator"):
         lines.append("- Emulator: " + ", ".join(f"{k} {v}" for k, v in meta["emulator"].items()))
     return "\n".join(lines)
 
 
+def public_title(s):
+    """A failure's title as a post may carry it: a crash keeps its code,
+    module-relative offsets and access kind, not the address it touched."""
+    t = s.title
+    m = re.search(r" \((read|write|execute) (0x[0-9a-fA-F]+)\)$", t)
+    if s.kind == "crash" and m:
+        where = " at address 0" if int(m.group(2), 16) == 0 else ""
+        t = t[:m.start()] + f" ({m.group(1)}{where})"
+    return HASH16.sub("<shader>", t)[:120]
+
+
+# Posts (drafts, comments, filled-in forms) carry an allowlist only: kind,
+# title, count, your machine and settings, and the related reports. Log lines
+# can hold values read from title memory (VICTORY_PEEK) and title shader
+# hashes stay out of comments (VIctory's coordination rule 7, #1633); both
+# stay in the local output.
+POST_NOTE = "Written with victory-doctor {v}: no log lines, shader hashes or memory values; user names removed."
+
+
 def issue_draft(meta, s):
-    title = s.title[:120]
+    title = public_title(s)
     related = "\n".join(f"- {m['repo']}#{m['number']} ({'PR' if m['pr'] else 'issue'}, "
                         f"{'merged' if m['merged'] else m['state']}): {m['title']}" for m in s.matches[:8])
     body = f"""### What happened
 
-{s.title} (seen {s.count} time(s) in one run).
-
-```
-{chr(10).join(s.excerpt[:14])}
-```
+- Kind: {s.kind}
+- Failure: {title}
+- Times in one run: {s.count}
 
 ### Environment
 
@@ -692,21 +739,17 @@ def issue_draft(meta, s):
 
 {related or "None found (searched open and closed issues and pull requests)."}
 
-Found with victory-doctor {VERSION}. No game data; user names and paths are removed from the excerpt.
+{POST_NOTE.format(v=VERSION)}
 """
     return title, redact(body)
 
 
 def comment_draft(meta, s, issue):
-    body = f"""Seen here too ({s.count} time(s) in one run).
-
-```
-{chr(10).join(s.excerpt[:10])}
-```
+    body = f"""Seen here too: {public_title(s)} ({s.count} time(s) in one run).
 
 {environment_block(meta)}
 
-Found with victory-doctor {VERSION}; user names and paths removed.
+{POST_NOTE.format(v=VERSION)}
 """
     return redact(body)
 
@@ -872,7 +915,8 @@ def cmd_compare(a):
 
 
 def cmd_record(a):
-    settings = dict(kv.split("=", 1) for kv in a.setting) if a.setting else settings_from_env()
+    settings = ({k: public_setting(k, v) for k, v in (kv.split("=", 1) for kv in a.setting)}
+                if a.setting else settings_from_env())
     sigs = scan(a.log)
     rec = make_record(a.log, sigs, settings, {"name": a.emulator} if a.emulator else {}, a.note)
     p = save_record(rec)
@@ -1030,7 +1074,7 @@ input,select{font:inherit;padding:6px;border:1px solid var(--line);border-radius
 .hide{display:none}
 </style></head><body>
 <header><h1>victory-doctor</h1><nav>
-<button data-tab="scan" class="on">Diagnose a run</button><button data-tab="runs">My runs</button><button data-tab="shared">Shared runs</button>
+<button data-tab="scan" class="on">Diagnose a run</button><button data-tab="runs">My runs</button><button data-tab="shared">Shared runs</button><button data-tab="pc">This PC</button>
 </nav></header>
 <main>
 <section id="scan">
@@ -1043,6 +1087,7 @@ input,select{font:inherit;padding:6px;border:1px solid var(--line);border-radius
 <section id="runs" class="hide"><div class="card"><div class="row">
  <select id="ra"></select><span>vs</span><select id="rb"></select><button class="b" id="cmp">Compare</button></div></div>
  <div id="cmpout"></div><div id="runlist"></div></section>
+<section id="pc" class="hide"><div class="card"><div class="row"><button class="b" id="pcgo">Check this PC</button><span class="muted">Known failures this PC is likely to meet, before a run.</span></div></div><div id="pcout"></div></section>
 <section id="shared" class="hide"><div class="card"><div class="row"><input id="sgpu" placeholder="GPU filter, e.g. 4060">
  <button class="b" id="sgo">Load shared runs</button></div><p class="muted">From the public dataset; submit your own runs with <code>submit &lt;run id&gt;</code>.</p></div>
  <div id="sout"></div></section>
@@ -1080,6 +1125,7 @@ $("#cmp").onclick=async()=>{const d=await call("/api/compare",{a:$("#ra").value,
  <p class=t>New in B</p><ul>${d.new_in_b.map(f=>`<li>${esc(f.key)} x${f.count}</li>`).join("")||"<li class=muted>none</li>"}</ul>
  <p class=t>Gone in B</p><ul>${d.gone_in_b.map(f=>`<li>${esc(f.key)} x${f.count}</li>`).join("")||"<li class=muted>none</li>"}</ul>
  <p class=t>Settings changed</p><ul>${d.settings_changed.map(s=>`<li>${esc(s.key)}: ${esc(s.a)} &rarr; ${esc(s.b)}</li>`).join("")||"<li class=muted>none</li>"}</ul></div>`};
+$("#pcgo").onclick=async()=>{$("#pcout").innerHTML="<div class=card>Checking...</div>";const d=await call("/api/check");$("#pcout").innerHTML=`<div class=card><ul>${d.map(r=>`<li>${r.ok?"&#10003;":"&#9888;"} ${esc(r.text)}</li>`).join("")}</ul></div>`};
 $("#sgo").onclick=async()=>{try{const d=await call("/api/stats?gpu="+encodeURIComponent($("#sgpu").value));
  $("#sout").innerHTML=`<div class=card><p class=muted>${d.runs} shared run(s)</p><table><tr><th>GPU</th><th>Mode</th><th>Runs</th><th>Reached world</th><th>Median fps</th><th>Best</th><th>Best settings</th></tr>
  ${d.groups.map(g=>`<tr><td>${esc(g.gpu)}</td><td>${esc(g.console)}</td><td>${g.runs}</td><td>${g.reached_world}</td><td>${g.fps_median??""}</td><td>${g.fps_best??""}</td><td class=muted>${esc(Object.entries(g.best_settings).map(([k,v])=>k+"="+v).join(", ")||"defaults")}</td></tr>`).join("")}</table>
@@ -1133,6 +1179,8 @@ def cmd_ui(a):
                                      "fps": r["performance"].get("fps_median"), "ms": r["performance"].get("ms_median"),
                                      "failures": len(r.get("failures", []))})
                     return self.reply(200, rows)
+                if path == "/api/check":
+                    return self.reply(200, [{"ok": ok, "text": t} for ok, t in preflight()])
                 if path == "/api/stats":
                     return self.reply(200, stats_data(q.get("gpu", [""])[0] or None))
                 self.reply(404, {"error": "not found"})
@@ -1209,6 +1257,94 @@ def cmd_ui(a):
         pass
 
 
+def preflight():
+    """Known failures this PC is likely to meet, before a run: (ok, text) pairs."""
+    out = []
+    win = platform.system() == "Windows"
+    if not win:
+        return [(False, "VIctory runs on Windows (Linux/Proton is experimental: Marvisak/VIctory#340).")]
+    build = int(re.sub(r"\D", "", platform.version().split(".")[-1]) or 0)
+    if build and build < 22000:
+        out.append((False, f"Windows 10 (build {build}): install the D3D12 Agility SDK, or root signatures are refused "
+                           "(Marvisak/VIctory#753, #84)."))
+    else:
+        out.append((True, f"Windows 11 (build {build})."))
+    m = machine()
+    cpu = m.get("cpu", "")
+    if "Intel" in cpu:
+        out.append((False, f"{cpu}: the title uses AMD-only CLZERO and CLWB; without the CPU-emulation patches "
+                           "it stops at once (0xc000001d, Marvisak/VIctory#85, #106)."))
+    else:
+        out.append((True, f"CPU: {cpu}."))
+    for g in m.get("gpus", []):
+        name = g.split(" (driver")[0]
+        if "NVIDIA" in g:
+            out.append((False, f"{name}: NVIDIA caps the view heap at 1,000,000 (Marvisak/VIctory#1760) and runs no "
+                               "64-lane waves (#2220); expect refused pipelines and a capped heap. The fxceless fork "
+                               "is the NVIDIA build most people get into the world with."))
+        elif re.search(r"RX 9\d{3}", g):
+            out.append((False, f"{name}: RDNA4's shader compiler crashes when pipelines compile on several threads "
+                               "(Marvisak/VIctory#2124)."))
+        elif "Radeon" in g or "AMD" in g:
+            out.append((True, f"{name}: AMD, 64-lane waves run natively."))
+        else:
+            out.append((True, f"{name}."))
+    vram = powershell("(Get-CimInstance Win32_VideoController | Measure-Object AdapterRAM -Maximum).Maximum")
+    commit = powershell("(Get-CimInstance Win32_OperatingSystem).TotalVirtualMemorySize")
+    ram = m.get("ram_gb") or 0
+    if ram and ram < 16:
+        out.append((False, f"{ram} GB RAM: the world needs about 20 GB of commit; expect paging."))
+    elif ram:
+        out.append((True, f"{ram} GB RAM."))
+    if commit.isdigit():
+        gb = int(commit) // (1024 * 1024)
+        ok = gb >= 40
+        out.append((ok, f"Windows commit limit {gb} GB" + ("." if ok else ": under 40 GB the title can stop with "
+                    "os error 1455; raise the paging file (Marvisak/VIctory#23).")))
+    if vram.isdigit() and int(vram) and int(vram) < 7 * 2**30:
+        out.append((False, "Under 8 GB of VRAM: Series X targets do not fit; try `--console series-s` "
+                           "(Marvisak/VIctory#1240, #203)."))
+    data = Path(os.environ.get("LOCALAPPDATA", "")) / "victory"
+    try:
+        free = __import__("shutil").disk_usage(data if data.exists() else Path.home()).free // 2**30
+        out.append((free >= 10, f"{free} GB free for VIctory's cache" + ("." if free >= 10 else
+                    ": the shader and pipeline caches need several GB.")))
+    except OSError:
+        pass
+    return out
+
+
+def cmd_check(a):
+    rows = preflight()
+    if a.json:
+        print(json.dumps([{"ok": ok, "text": t} for ok, t in rows], indent=1))
+        return
+    print("Before a run: what this PC is likely to meet.\n")
+    for ok, t in rows:
+        print(f"  {'ok' if ok else '!!'}  {t}")
+
+
+def cmd_suggest(a):
+    gpus = [g.split(" (driver")[0] for g in machine().get("gpus", [])]
+    main = next((g for g in gpus if "NVIDIA" in g or re.search(r"RX \d", g)), gpus[0] if gpus else None)
+    if not main:
+        sys.exit("No GPU found.")
+    model = re.search(r"(RTX|GTX|RX)\s*\d{3,4}\w*", main)
+    key = model.group(0) if model else main
+    try:
+        d = stats_data(gpu=key)
+    except (urllib.error.URLError, ValueError) as e:
+        sys.exit(f"Could not read the shared runs ({e}).")
+    print(f"Your GPU: {main}. Shared runs on {key}: {d['runs']}.\n")
+    for g in d["groups"]:
+        if g["fps_median"]:
+            print(f"  {g['gpu']} [{g['console']}]: median {g['fps_median']:.1f} fps, best {g['fps_best']:.1f} with:")
+            for k, v in g["best_settings"].items():
+                print(f"      {k}={v}")
+    if not d["runs"]:
+        print("  Nobody has shared a run on this GPU yet: `submit` yours to start it.")
+
+
 def cmd_selftest(_):
     sample = """2026-11-25T10:23:56.997492Z  WARN victory_gpu::descriptor::host: host view heap capped at 1000000; views past it read a null slot count=1245184
 2026-11-25T10:24:00.000000Z  WARN victory_gpu::pipeline::host: host pipeline refused error=The parameter is incorrect. (0x80070057) shaders=[compute 6f225b641c5b0708]
@@ -1247,6 +1383,23 @@ C:\\Users\\someone\\AppData\\Local\\victory
     perf = performance(p)
     assert perf["reached"] == "world" and perf["fps_median"] == 3.1 and perf["gpu_ms_median"] == 114.8, perf
     p.unlink()
+    # Posts carry no log lines, shader hashes or title memory values.
+    peeked = """2026-11-25T10:24:00.000000Z  INFO victory_gpu::capture: peek frame 0x1a2b3c4d00: 11223344 55667788
+2026-11-25T10:24:00.100000Z  WARN victory_gpu::pipeline::host: host pipeline refused error=x (0x80070057) shaders=[compute 6f225b641c5b0708]
+VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x7ffe12345678: nothing mapped there)"""
+    found = {}
+    scan_lines(peeked.splitlines(), found, "selftest")
+    meta = {"machine": {"os": "test", "cpu": "test"},
+            "settings": {"VICTORY_SKIP_PIPELINES": "6f225b641c5b0708,4273011b11446435", "VICTORY_PEEK": "0x1a2b3c4d00:16"}}
+    for sig in found.values():
+        _, body = issue_draft(meta, sig)
+        texts = [body, comment_draft(meta, sig, 1)]
+        for t in texts:
+            for secret in ("6f225b641c5b0708", "4273011b11446435", "11223344", "0x1a2b3c4d00", "0x7ffe12345678", "peek"):
+                assert secret not in t, (secret, t)
+    assert "<2 shader hashes>" in environment_block(meta)
+    crash = next(x for x in found.values() if x.kind == "crash")
+    assert public_title(crash).endswith("(write)"), public_title(crash)
     print("selftest ok")
 
 
@@ -1327,6 +1480,13 @@ def main():
     p.add_argument("--mine", action="store_true", help="include your own unsubmitted runs")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(fn=cmd_stats)
+
+    p = sub.add_parser("check", help="before a run: the known failures this PC is likely to meet")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("suggest", help="the best settings others reported for your GPU")
+    p.set_defaults(fn=cmd_suggest)
 
     p = sub.add_parser("selftest", help="check the parsers")
     p.set_defaults(fn=cmd_selftest)

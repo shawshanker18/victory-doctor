@@ -25,6 +25,7 @@ It opens a page on your own PC (127.0.0.1 only):
 - **Diagnose a run:** pick a log. Each failure shows a NEW / KNOWN / PR / MERGED badge, the matching reports, and buttons to draft an issue or add your details to an existing one.
 - **My runs:** every run you diagnosed, and any two compared side by side.
 - **Shared runs:** frame rates by GPU, the best settings seen, and the most common failures, from everyone's submitted runs.
+- **This PC:** the pre-flight check.
 
 ## Use from the command line
 
@@ -62,6 +63,8 @@ Then:
 | `record LOG` | makes a run record from a log (`--setting KEY=VALUE` for what you changed) |
 | `submit RUN` | shares a run record in the public runs dataset |
 | `stats` | what the shared runs say: frame rates by GPU, the best settings seen, the most common failures |
+| `check` | before a run: the known failures this PC is likely to meet (Windows 10 without Agility, Intel CPUs, NVIDIA's heap cap, low commit, low VRAM) |
+| `suggest` | the best settings others shared for your GPU |
 | `ui` | the same in a local web page |
 | `selftest` | checks the parsers |
 
@@ -74,6 +77,7 @@ GitHub lookups work without an account (10 searches a minute). With `GITHUB_TOKE
 - Nothing is posted unless you run `post`, `comment` or `submit` and confirm. `post` and `submit` only open GitHub's form in your browser; you send it.
 - Lookups send only the failure's search terms: an offset, an error code, a message's words, a shader hash.
 - Drafts and run records have your user name, home folder and computer name taken out.
+- Anything meant for posting (drafts, comments, filled-in forms, run records) carries an allowlist only: the failure's kind, title, count, your machine and settings. Log lines can hold values read from the title's memory, and VIctory's rules keep the title's shader hashes out of comments, so both stay on your PC. Settings that name them (`VICTORY_SKIP_PIPELINES`, `VICTORY_PEEK`, ...) are posted as `<n shader hashes>` or `<set>`.
 - No game data is read beyond the logs, and none is sent.
 
 ## The runs dataset
