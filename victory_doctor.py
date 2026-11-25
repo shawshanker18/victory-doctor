@@ -526,7 +526,9 @@ def machine():
         if cpu:
             m["cpu"] = cpu
         gpus = powershell("Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + '|' + $_.DriverVersion }")
-        m["gpus"] = [g.split("|")[0] + " (driver " + g.split("|")[1] + ")" for g in gpus.splitlines() if "|" in g]
+        skip = ("virtual", "basic display", "basic render", "mobile monitor", "remote display")
+        m["gpus"] = [g.split("|")[0] + " (driver " + g.split("|")[1] + ")" for g in gpus.splitlines()
+                     if "|" in g and not any(s in g.lower() for s in skip)]
         ram = powershell("[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)")
         if ram:
             m["ram_gb"] = int(float(ram))
