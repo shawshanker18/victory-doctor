@@ -284,7 +284,7 @@ def tail_since(path, since, until=None):
 
 
 def log_end(log):
-    """The last timestamp in a log (unix seconds), plus five minutes for the crash report."""
+    """The last timestamp in a log (unix seconds), plus a minute for the crash report."""
     stamp = None
     with open(log, "rb") as f:
         f.seek(0, 2)
@@ -296,7 +296,7 @@ def log_end(log):
     if not stamp:
         return None
     t = datetime.datetime.fromisoformat(stamp).replace(tzinfo=datetime.timezone.utc)
-    return int(t.timestamp()) + 300
+    return int(t.timestamp()) + 60
 
 
 def scan(log, crashes=None, title_crashes=(), since=None):
