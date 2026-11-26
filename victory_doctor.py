@@ -1404,6 +1404,9 @@ VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(prog="victory-doctor", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd_name", required=True)
